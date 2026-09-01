@@ -1,0 +1,243 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────
+
+// Case type
+// FAILED_PAYMENT      - card/bank payment failure
+// ABANDONED_CHECKOUT  - cart abandoned before payment
+// FAILED_SUBSCRIPTION - subscription renewal failure
+// B2B_RECEIVABLE      - overdue B2B invoice
+
+// Case status progression:
+// DETECTED → DIAGNOSING → INTERVENING → PROMISED → RECOVERED
+//                                                 → ESCALATED
+//                                                 → WRITTEN_OFF
+
+// Root causes
+// Payment: CARD_EXPIRED, INSUFFICIENT_FUNDS, GATEWAY_TIMEOUT, BANK_DECLINE, LOST_STOLEN_CARD, ACCOUNT_CLOSED, MANDATE_LAPSED
+// Checkout: PRICE_SHOCK, PAYMENT_FRICTION, SHIPPING_COST, TRUST_CONCERN, DISTRACTION
+// Invoice: INVOICE_DISPUTE, OVERDUE_GENUINE
+
+// ─────────────────────────────────────────────
+// Batch — groups cases from one synthetic run
+// ─────────────────────────────────────────────
+model Batch {
+  id            String   @id @default(cuid())
+  config        String   // JSON: { batchSize, typeMix, severityDist }
+  startedAt     DateTime @default(now())
+  completedAt   DateTime?
+  totalAtRisk   Float    @default(0)
+  totalRecovered Float   @default(0)
+  caseCount     Int      @default(0)
+  recoveredCount Int     @default(0)
+  writtenOffCount Int    @default(0)
+  escalatedCount Int     @default(0)
+
+  cases      Case[]
+  auditEntries AuditEntry[]
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────
+// Case — one revenue-risk event
+// ─────────────────────────────────────────────
+model Case {
+  id              String   @id @default(cuid())
+  batchId         String
+  batch           Batch    @relation(fields: [batchId], references: [id])
+
+  // Classification
+  type            String   // FAILED_PAYMENT | ABANDONED_CHECKOUT | FAILED_SUBSCRIPTION | B2B_RECEIVABLE
+  status          String   @default("DETECTED") // DETECTED | DIAGNOSING | INTERVENING | PROMISED | RECOVERED | ESCALATED | WRITTEN_OFF
+
+  // Customer
+  customerId      String
+  customerName    String
+  customerEmail   String
+  customerPhone   String
+  customerSegment String   @default("CONSUMER") // CONSUMER | SMB | ENTERPRISE
+
+  // Financial
+  amount          Float    // INR
+  currency        String   @default("INR")
+
+  // Event metadata (JSON: decline codes, cart items, invoice details, etc.)
+  eventMetadata   String   @default("{}")
+
+  // Risk assessment
+  riskScore       Float    @default(0)   // 0–100
+  severity        String   @default("MEDIUM")  // LOW | MEDIUM | HIGH | CRITICAL
+  urgency         String   @default("MEDIUM")  // LOW | MEDIUM | HIGH
+  naturalRecoveryLikelihood String @default("LOW") // LOW | MEDIUM | HIGH
+
+  // Compliance tracking
+  contactCount    Int      @default(0)
+  isDND           Boolean  @default(false)
+  optedOutAt      DateTime?
+  currentRung     Int      @default(0)  // 0 = not started, 1-4 = escalation rung
+
+  // Outcome
+  recoveredAmount Float?
+  recoveredAt     DateTime?
+  terminatedAt    DateTime?
+  terminalReason  String?
+
+  // Timestamps
+  eventOccurredAt DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  diagnosis       Diagnosis?
+  interventions   Intervention[]
+  auditEntries    AuditEntry[]
+  promises        PromiseToPay[]
+}
+
+// ─────────────────────────────────────────────
+// Diagnosis — Claude root-cause classification
+// ─────────────────────────────────────────────
+model Diagnosis {
+  id          String   @id @default(cuid())
+  caseId      String   @unique
+  case        Case     @relation(fields: [caseId], references: [id])
+
+  rootCause   String   // enum string: CARD_EXPIRED, INSUFFICIENT_FUNDS, etc.
+  confidence  Float    // 0.0–1.0
+  reasoning   String   // Full LLM reasoning text (stored for audit)
+  modelUsed   String   // claude-3-5-sonnet or MOCK
+  isMock      Boolean  @default(false)
+
+  // Sub-classification
+  subCategory String?  // Additional detail
+  actionability String @default("MEDIUM") // LOW | MEDIUM | HIGH (how actionable is recovery)
+
+  createdAt   DateTime @default(now())
+}
+
+// ─────────────────────────────────────────────
+// Intervention — one outbound action attempt
+// ─────────────────────────────────────────────
+model Intervention {
+  id          String   @id @default(cuid())
+  caseId      String
+  case        Case     @relation(fields: [caseId], references: [id])
+
+  rung        Int      // 1-4 escalation rung
+  channel     String   // EMAIL | SMS | WHATSAPP | VOICE | RETRY | NONE
+  messageContent String @default("") // Full generated message/script text
+
+  // Claude rationale for this intervention choice
+  decisionRationale String @default("")
+
+  // Compliance checks result (JSON array of check results)
+  complianceChecks String @default("[]")
+
+  // Execution
+  scheduledAt DateTime
+  executedAt  DateTime?
+  outcome     String?  // DELIVERED | BOUNCED | PAYMENT_SUCCEEDED | PAYMENT_FAILED | NO_RESPONSE | BLOCKED
+
+  // If blocked by compliance rule
+  blockedBy   String?  // rule name that blocked
+  blockedReason String?
+
+  // Result metadata
+  externalId  String?  // mock message ID
+  simulatedAt DateTime? // simulated clock time of execution
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────
+// AuditEntry — append-only audit trail
+// ─────────────────────────────────────────────
+model AuditEntry {
+  id        String   @id @default(cuid())
+  caseId    String?
+  case      Case?    @relation(fields: [caseId], references: [id])
+  batchId   String?
+  batch     Batch?   @relation(fields: [batchId], references: [id])
+
+  stage     String   // INGESTION | DETECTION | DIAGNOSIS | DECISION | EXECUTION | TRACKING | MEASUREMENT
+  event     String   // RISK_DETECTED | DIAGNOSIS_MADE | INTERVENTION_DECIDED | ACTION_EXECUTED | COMPLIANCE_CHECKED | OUTCOME_RECORDED | PROMISE_LOGGED | PROMISE_FULFILLED | PROMISE_BROKEN | CASE_CLOSED
+
+  details   String   @default("{}") // JSON — full context of the event
+
+  actor     String   @default("SYSTEM") // SYSTEM | CLAUDE | COMPLIANCE_ENGINE | MOCK_ADAPTER
+
+  // Simulated clock time (may differ from wall time)
+  simulatedAt DateTime?
+
+  // Wall-clock time (immutable, set on insert only)
+  timestamp DateTime @default(now())
+}
+
+// ─────────────────────────────────────────────
+// PromiseToPay — customer payment commitments
+// ─────────────────────────────────────────────
+model PromiseToPay {
+  id          String   @id @default(cuid())
+  caseId      String
+  case        Case     @relation(fields: [caseId], references: [id])
+
+  amount      Float
+  dueDate     DateTime  // simulated due date
+  madeAt      DateTime  // simulated time promise was made
+
+  status      String   @default("PENDING") // PENDING | FULFILLED | BROKEN | FOLLOW_UP
+
+  fulfilledAt DateTime?
+  brokenAt    DateTime?
+  followUpAt  DateTime?
+
+  notes       String   @default("")
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────
+// Settings — singleton configuration row
+// ─────────────────────────────────────────────
+model Settings {
+  id                    String @id @default("singleton")
+
+  // Compliance
+  maxContactAttempts    Int    @default(5)
+  quietHoursStart       Int    @default(9)   // 24h format (9 = 9:00 AM)
+  quietHoursEnd         Int    @default(21)  // 24h format (21 = 9:00 PM)
+  dndList               String @default("[]") // JSON array of customer IDs
+
+  // Escalation timing (sim-hours between rungs)
+  rung1DelayHours       Int    @default(2)
+  rung2DelayHours       Int    @default(24)
+  rung3DelayHours       Int    @default(48)
+  rung4DelayHours       Int    @default(72)
+
+  // Intervention thresholds
+  discountPct           Float  @default(10.0)  // % discount offered at rung 3
+  paymentPlanMinAmount  Float  @default(5000.0) // min amount to offer payment plan
+
+  // Write-off threshold
+  writeOffAfterDays     Int    @default(30)  // sim-days after which to write off
+
+  // Recovery probability modifiers (JSON)
+  recoveryProbabilities String @default("{\"CARD_EXPIRED\":0.7,\"INSUFFICIENT_FUNDS\":0.4,\"GATEWAY_TIMEOUT\":0.85,\"BANK_DECLINE\":0.5,\"LOST_STOLEN_CARD\":0.2,\"ACCOUNT_CLOSED\":0.1,\"MANDATE_LAPSED\":0.6,\"PRICE_SHOCK\":0.55,\"PAYMENT_FRICTION\":0.65,\"SHIPPING_COST\":0.6,\"TRUST_CONCERN\":0.45,\"DISTRACTION\":0.7,\"INVOICE_DISPUTE\":0.3,\"OVERDUE_GENUINE\":0.5}")
+
+  updatedAt             DateTime @updatedAt
+}
